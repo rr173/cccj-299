@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import sqlite3
 import uuid
 from pathlib import Path
@@ -1327,5 +1329,1560 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
                           f"source slot {entry['source_slot']} has no audio")
             return Response(content=row["audio"], media_type="audio/wav",
                             headers={"X-Source-Slot": str(entry["source_slot"])})
+
+    # ------------------------------------------------------------------ #
+    # 核账、付款单与回执
+    # ------------------------------------------------------------------ #
+
+    def _pick(data: Any, *names: str) -> Any:
+        if not isinstance(data, dict):
+            return None
+        for name in names:
+            if name in data and data[name] is not None:
+                return data[name]
+        return None
+
+    def _required_int(value: Any, field: str, *, minimum: int = 0) -> int:
+        if value is None:
+            raise err(400, "field_required", f"{field} is required")
+        if isinstance(value, bool):
+            raise err(400, "invalid_integer", f"{field} must be an integer")
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, float) and value.is_integer():
+            number = int(value)
+        elif isinstance(value, str):
+            try:
+                number = int(value.strip())
+            except ValueError:
+                raise err(400, "invalid_integer", f"{field} must be an integer")
+        else:
+            raise err(400, "invalid_integer", f"{field} must be an integer")
+        if number < minimum:
+            raise err(400, "integer_out_of_range",
+                      f"{field} must be >= {minimum}")
+        return number
+
+    def _payee_id(value: Any) -> str:
+        if value is None:
+            raise err(400, "payee_id_required", "payee identifier is required")
+        payee = str(value).strip()
+        if not payee:
+            raise err(400, "payee_id_required", "payee identifier is required")
+        return payee
+
+    def _receipt_no(value: Any) -> str:
+        if value is None:
+            raise err(400, "receipt_no_required",
+                      "paid receipt requires an external receipt number")
+        number = str(value).strip()
+        if not number:
+            raise err(400, "receipt_no_required",
+                      "paid receipt requires an external receipt number")
+        return number
+
+    def _content_hash(payload: Any) -> str:
+        id_keys = {
+            "request_id", "idempotency_key", "request_key",
+            "idempotency-request-id", "x-request-id",
+        }
+
+        def clean(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    k: clean(v) for k, v in value.items()
+                    if str(k).lower() not in id_keys
+                }
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            return value
+
+        encoded = json.dumps(
+            clean(payload), sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _json_body(request: Request) -> Any:
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        return {} if body is None else body
+
+    def _current_billing_row(
+        conn: sqlite3.Connection, session_id: int
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM billing_versions WHERE session_id=? "
+            "ORDER BY version DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+    def _billing_version_dict(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        current_version: int | None = None,
+        include_slots: bool = True,
+    ) -> dict[str, Any]:
+        session_id = row["session_id"]
+        if current_version is None:
+            current_row = _current_billing_row(conn, session_id)
+            current_version = current_row["version"] if current_row else 0
+
+        entry_rows = conn.execute(
+            "SELECT * FROM billing_entries WHERE version_id=? "
+            "ORDER BY ordinal, id",
+            (row["id"],),
+        ).fetchall()
+        entries: list[dict[str, Any]] = []
+        duty_totals: dict[int, dict[str, Any]] = {}
+        payee_totals: dict[str, dict[str, Any]] = {}
+
+        for entry_row in entry_rows:
+            billed_slots: list[int] = []
+            if include_slots:
+                billed_slots = [
+                    r["slot"] for r in conn.execute(
+                        "SELECT slot FROM billing_entry_slots "
+                        "WHERE entry_id=? ORDER BY slot",
+                        (entry_row["id"],),
+                    ).fetchall()
+                ]
+            entry = dict(entry_row)
+            entry.update({
+                "billing_entry_id": entry_row["id"],
+                "entry_id": entry_row["id"],
+                "id": entry_row["id"],
+                "payee": entry_row["payee_id"],
+                "unit_amount": entry_row["unit_amount_cents"],
+                "amount_per_slot_cents": entry_row["unit_amount_cents"],
+                "rate_cents": entry_row["unit_amount_cents"],
+                "voiced_slots": billed_slots,
+                "billed_slots": billed_slots,
+                "slots": billed_slots,
+                "slot_count": entry_row["voiced_slot_count"],
+                "billable_slot_count": entry_row["voiced_slot_count"],
+                "line_amount_cents": entry_row["amount_cents"],
+                "amount": entry_row["amount_cents"],
+            })
+            entries.append(entry)
+
+            duty_id = entry_row["duty_id"]
+            duty_agg = duty_totals.setdefault(duty_id, {
+                "duty_id": duty_id,
+                "voiced_slot_count": 0,
+                "slot_count": 0,
+                "amount_cents": 0,
+                "entries": [],
+            })
+            duty_agg["voiced_slot_count"] += entry_row["voiced_slot_count"]
+            duty_agg["slot_count"] += entry_row["voiced_slot_count"]
+            duty_agg["amount_cents"] += entry_row["amount_cents"]
+            duty_agg["entries"].append(entry)
+
+            payee = entry_row["payee_id"]
+            payee_agg = payee_totals.setdefault(payee, {
+                "payee_id": payee,
+                "payee": payee,
+                "voiced_slot_count": 0,
+                "slot_count": 0,
+                "amount_cents": 0,
+                "entries": [],
+            })
+            payee_agg["voiced_slot_count"] += entry_row["voiced_slot_count"]
+            payee_agg["slot_count"] += entry_row["voiced_slot_count"]
+            payee_agg["amount_cents"] += entry_row["amount_cents"]
+            payee_agg["entries"].append(entry)
+
+        duties: list[dict[str, Any]] = []
+        for duty_id in sorted(duty_totals):
+            agg = duty_totals[duty_id]
+            duty = conn.execute(
+                "SELECT interpreter FROM duties WHERE id=?", (duty_id,)
+            ).fetchone()
+            agg["interpreter"] = duty["interpreter"] if duty else None
+            duties.append(agg)
+
+        payees = [payee_totals[key] for key in sorted(payee_totals)]
+        total_count = sum(e["voiced_slot_count"] for e in entries)
+        total_amount = sum(e["amount_cents"] for e in entries)
+
+        return {
+            "billing_version_id": row["id"],
+            "id": row["id"],
+            "session_id": session_id,
+            "version": row["version"],
+            "account_version": row["version"],
+            "base_version": row["base_version"],
+            "cutoff_slot": row["cutoff_slot"],
+            "cutoff": row["cutoff_slot"],
+            "through_slot": row["cutoff_slot"],
+            "end_slot": row["cutoff_slot"],
+            "exclusive_end_slot": row["cutoff_slot"],
+            "created_at": row["created_at"],
+            "is_current": row["version"] == current_version,
+            "current": row["version"] == current_version,
+            "entries": entries,
+            "billing_entries": entries,
+            "line_items": entries,
+            "duties": duties,
+            "duty_summaries": duties,
+            "payees": payees,
+            "payee_summaries": payees,
+            "voiced_slot_count": total_count,
+            "total_voiced_slot_count": total_count,
+            "total_count": total_count,
+            "amount_cents": total_amount,
+            "total_amount_cents": total_amount,
+            "total_amount": total_amount,
+        }
+
+    def _create_billing_version(
+        conn: sqlite3.Connection,
+        session_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        current_row = _current_billing_row(conn, session_id)
+        current_version = current_row["version"] if current_row else 0
+
+        cutoff = _required_int(
+            _pick(payload, "cutoff_slot", "settlement_cutoff_slot",
+                  "up_to_slot", "upto_slot", "as_of_slot", "to_slot",
+                  "cutoff", "through_slot", "until_slot",
+                  "exclusive_end_slot", "end_slot"),
+            "cutoff_slot",
+        )
+        base_raw = _pick(
+            payload, "base_version", "based_on_version", "based_on", "base",
+            "parent_version", "previous_version", "expected_version",
+            "account_version", "billing_version", "version",
+        )
+        base_version = current_version if base_raw is None else _required_int(
+            base_raw, "base_version"
+        )
+        if base_version != current_version:
+            raise err(
+                409, "stale_billing_version",
+                f"this session is at billing version {current_version}; "
+                f"submission was based on {base_version}",
+            )
+
+        frontier = compute_frontier(conn, session_id)
+        if cutoff > frontier:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "cutoff_beyond_published_range",
+                    "message": f"billing cutoff {cutoff} is beyond the "
+                               f"continuous published prefix (frontier={frontier})",
+                    "cutoff_slot": cutoff,
+                    "frontier": frontier,
+                },
+            )
+        if current_row is not None and cutoff < current_row["cutoff_slot"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "billing_cutoff_cannot_shrink",
+                    "message": "a corrected audit must not omit the previously "
+                               "audited tail",
+                    "cutoff_slot": cutoff,
+                    "previous_cutoff_slot": current_row["cutoff_slot"],
+                },
+            )
+
+        raw_entries = _pick(
+            payload, "entries", "billing_entries", "billing_items",
+            "items", "rates", "charges", "lines",
+        )
+        if raw_entries is None:
+            raw_entries = []
+        if not isinstance(raw_entries, list):
+            raise err(400, "entries_must_be_list",
+                      "billing entries must be a list")
+
+        parsed: list[dict[str, Any]] = []
+        for index, raw_entry in enumerate(raw_entries):
+            if not isinstance(raw_entry, dict):
+                raise err(400, "invalid_billing_entry",
+                          f"billing entry {index} must be an object")
+            duty_id = _required_int(
+                _pick(raw_entry, "duty_id", "duty"),
+                f"entries[{index}].duty_id", minimum=1,
+            )
+            duty = conn.execute(
+                "SELECT * FROM duties WHERE id=?", (duty_id,)
+            ).fetchone()
+            if duty is None or duty["session_id"] != session_id:
+                raise err(400, "duty_not_in_session",
+                          f"duty {duty_id} does not belong to session "
+                          f"{session_id}")
+
+            range_value = _pick(raw_entry, "slot_range", "range", "interval")
+            range_start = range_end = None
+            if isinstance(range_value, (list, tuple)) and len(range_value) == 2:
+                range_start, range_end = range_value
+            start_slot = _required_int(
+                _pick(raw_entry, "start_slot", "slot_start", "first_slot",
+                      "from_slot", "since_slot", "start")
+                if _pick(raw_entry, "start_slot", "slot_start", "first_slot",
+                         "from_slot", "since_slot", "start") is not None
+                else range_start,
+                f"entries[{index}].start_slot",
+            )
+            end_slot = _required_int(
+                _pick(raw_entry, "end_slot", "slot_end", "stop_slot",
+                      "until_slot", "exclusive_end_slot", "end")
+                if _pick(raw_entry, "end_slot", "slot_end", "stop_slot",
+                         "until_slot", "exclusive_end_slot", "end") is not None
+                else range_end,
+                f"entries[{index}].end_slot",
+            )
+            if end_slot < start_slot:
+                raise err(400, "bad_slot_range",
+                          f"entries[{index}] requires start_slot <= end_slot")
+
+            payee_id = _payee_id(_pick(
+                raw_entry, "payee_id", "payee", "recipient_id",
+                "recipient", "payee_identifier",
+            ))
+            unit_amount = _required_int(
+                _pick(raw_entry, "unit_amount_cents", "amount_per_slot_cents",
+                      "cents_per_slot", "rate_cents", "unit_price_cents",
+                      "unit_cents", "price_cents", "cents",
+                      "unit_amount", "amount_per_slot", "rate", "amount_cents"),
+                f"entries[{index}].unit_amount_cents",
+            )
+            parsed.append({
+                "ordinal": index,
+                "duty_id": duty_id,
+                "start_slot": start_slot,
+                "end_slot": end_slot,
+                "payee_id": payee_id,
+                "unit_amount_cents": unit_amount,
+                "slots": [],
+            })
+
+        mismatches: list[dict[str, Any]] = []
+        for slot in range(cutoff):
+            if is_silence(conn, session_id, slot):
+                continue
+            audio = qualifying_audio(conn, session_id, slot)
+            if audio is None:
+                mismatches.append({
+                    "slot": slot,
+                    "reason": "published_voice_not_found",
+                })
+                continue
+            actual_duty_id = audio["duty_id"]
+            matches = [
+                index for index, entry in enumerate(parsed)
+                if entry["duty_id"] == actual_duty_id
+                and entry["start_slot"] <= slot < entry["end_slot"]
+            ]
+            if len(matches) != 1:
+                mismatches.append({
+                    "slot": slot,
+                    "reason": "billing_entry_not_unique_match",
+                    "actual_duty_id": actual_duty_id,
+                    "matched_entry_indexes": matches,
+                })
+            else:
+                parsed[matches[0]]["slots"].append(slot)
+
+        if mismatches:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "billing_entries_do_not_match_program",
+                    "message": "every published voiced slot must match exactly "
+                               "one entry for the duty that recorded it",
+                    "issues": mismatches,
+                },
+            )
+
+        total_amount = sum(
+            len(entry["slots"]) * entry["unit_amount_cents"]
+            for entry in parsed
+        )
+        next_version = current_version + 1
+        cursor = conn.execute(
+            "INSERT INTO billing_versions "
+            "(session_id, version, base_version, cutoff_slot, total_amount_cents) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, next_version, base_version, cutoff, total_amount),
+        )
+        version_id = cursor.lastrowid
+        for entry in parsed:
+            count = len(entry["slots"])
+            amount = count * entry["unit_amount_cents"]
+            entry_cursor = conn.execute(
+                "INSERT INTO billing_entries "
+                "(session_id, version_id, version, ordinal, duty_id, "
+                "start_slot, end_slot, payee_id, unit_amount_cents, "
+                "voiced_slot_count, amount_cents) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, version_id, next_version, entry["ordinal"],
+                 entry["duty_id"], entry["start_slot"], entry["end_slot"],
+                 entry["payee_id"], entry["unit_amount_cents"], count, amount),
+            )
+            entry_id = entry_cursor.lastrowid
+            conn.executemany(
+                "INSERT INTO billing_entry_slots "
+                "(entry_id, session_id, version_id, slot, duty_id, payee_id, "
+                "unit_amount_cents) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (entry_id, session_id, version_id, slot,
+                     entry["duty_id"], entry["payee_id"],
+                     entry["unit_amount_cents"])
+                    for slot in entry["slots"]
+                ],
+            )
+
+        version_row = conn.execute(
+            "SELECT * FROM billing_versions WHERE id=?", (version_id,)
+        ).fetchone()
+        return _billing_version_dict(
+            conn, version_row, current_version=next_version
+        )
+
+    def _payee_balances(
+        conn: sqlite3.Connection,
+        session_id: int,
+        current_version: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if current_version is None:
+            current_row = _current_billing_row(conn, session_id)
+            current_version = current_row["version"] if current_row else 0
+
+        payable_rows = conn.execute(
+            "SELECT payee_id, COALESCE(SUM(amount_cents), 0) AS amount "
+            "FROM billing_entries WHERE session_id=? AND version=? "
+            "GROUP BY payee_id",
+            (session_id, current_version),
+        ).fetchall()
+        paid_rows = conn.execute(
+            "SELECT payee_id, COALESCE(SUM(amount_cents), 0) AS amount "
+            "FROM payment_items WHERE session_id=? AND status='paid' "
+            "GROUP BY payee_id",
+            (session_id,),
+        ).fetchall()
+        occupied_rows = conn.execute(
+            "SELECT payee_id, COALESCE(SUM(amount_cents), 0) AS amount "
+            "FROM payment_items WHERE session_id=? AND status='pending' "
+            "GROUP BY payee_id",
+            (session_id,),
+        ).fetchall()
+
+        payable = {r["payee_id"]: int(r["amount"]) for r in payable_rows}
+        paid = {r["payee_id"]: int(r["amount"]) for r in paid_rows}
+        occupied = {r["payee_id"]: int(r["amount"]) for r in occupied_rows}
+        payees = sorted(set(payable) | set(paid) | set(occupied))
+
+        result: list[dict[str, Any]] = []
+        for payee in payees:
+            payable_amount = payable.get(payee, 0)
+            paid_amount = paid.get(payee, 0)
+            occupied_amount = occupied.get(payee, 0)
+            balance = payable_amount - paid_amount - occupied_amount
+            openable = max(0, balance)
+            result.append({
+                "payee_id": payee,
+                "payee": payee,
+                "current_payable_cents": payable_amount,
+                "payable_cents": payable_amount,
+                "payable": payable_amount,
+                "paid_cents": paid_amount,
+                "paid": paid_amount,
+                "occupied_cents": occupied_amount,
+                "occupied": occupied_amount,
+                "reserved_cents": occupied_amount,
+                "held_cents": occupied_amount,
+                "pending_receipt_cents": occupied_amount,
+                "pending_cents": occupied_amount,
+                "pending_amount_cents": occupied_amount,
+                "balance_cents": balance,
+                "balance": balance,
+                "remaining_balance_cents": balance,
+                "remaining_payable_cents": balance,
+                "net_balance_cents": balance,
+                "available_cents": balance,
+                "available_balance_cents": balance,
+                "openable_amount_cents": openable,
+                "can_open_amount_cents": openable,
+            })
+        return result
+
+    def _payment_item_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item.update({
+            "payment_item_id": row["id"],
+            "item_id": row["id"],
+            "instruction_id": row["id"],
+            "payment_id": row["id"],
+            "instruction_no": f"PI-{row['id']:08d}",
+            "payment_instruction_no": f"PI-{row['id']:08d}",
+            "payee": row["payee_id"],
+            "instructed_amount_cents": row["amount_cents"],
+            "instruction_amount_cents": row["amount_cents"],
+            "amount": row["amount_cents"],
+            "receipt_no": row["external_receipt_no"],
+            "external_receipt_id": row["external_receipt_no"],
+            "paid_amount_cents": row["receipt_amount_cents"],
+            "is_pending": row["status"] == "pending",
+            "is_paid": row["status"] == "paid",
+            "is_unpaid": row["status"] == "unpaid",
+            "pending_receipt": row["status"] == "pending",
+        })
+        return item
+
+    def _payment_order_dict(
+        conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        item_rows = conn.execute(
+            "SELECT * FROM payment_items WHERE order_id=? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        items = [_payment_item_dict(item_row) for item_row in item_rows]
+        pending_amount = sum(
+            i["amount_cents"] for i in items if i["status"] == "pending"
+        )
+        paid_amount = sum(
+            i["amount_cents"] for i in items if i["status"] == "paid"
+        )
+        unpaid_amount = sum(
+            i["amount_cents"] for i in items if i["status"] == "unpaid"
+        )
+        if pending_amount == 0:
+            status = "completed"
+        elif pending_amount == row["total_amount_cents"] and not paid_amount \
+                and not unpaid_amount:
+            status = "pending"
+        else:
+            status = "partially_receipted"
+
+        order = dict(row)
+        order.update({
+            "payment_order_id": row["id"],
+            "order_id": row["id"],
+            "id": row["id"],
+            "payment_order_no": row["order_no"],
+            "order_number": row["order_no"],
+            "order_no": row["order_no"],
+            "request_id": row["request_key"],
+            "idempotency_key": row["request_key"],
+            "billing_version": row["account_version"],
+            "version": row["account_version"],
+            "status": status,
+            "stored_status": row["status"],
+            "items": items,
+            "payment_items": items,
+            "instructions": items,
+            "payment_instructions": items,
+            "transfers": items,
+            "payments": items,
+            "item_count": len(items),
+            "pending_count": sum(i["status"] == "pending" for i in items),
+            "paid_count": sum(i["status"] == "paid" for i in items),
+            "unpaid_count": sum(i["status"] == "unpaid" for i in items),
+            "pending_amount_cents": pending_amount,
+            "occupied_cents": pending_amount,
+            "paid_amount_cents": paid_amount,
+            "unpaid_amount_cents": unpaid_amount,
+            "amount_cents": row["total_amount_cents"],
+            "total_amount": row["total_amount_cents"],
+        })
+        return order
+
+    def _wrapped_order(order: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **order,
+            "payment_order": order,
+            "order": order,
+            "payment_orders": [order],
+            "orders": [order],
+        }
+
+    def _no_payment_order_body(
+        session_id: int,
+        request_key: str,
+        *,
+        replayed: bool,
+        reason: str = "no_positive_balance",
+    ) -> dict[str, Any]:
+        data = {
+            "session_id": session_id,
+            "payment_order_id": None,
+            "order_id": None,
+            "id": None,
+            "order_no": None,
+            "request_id": request_key,
+            "idempotency_key": request_key,
+            "created": False,
+            "replayed": replayed,
+            "reason": reason,
+            "items": [],
+            "payment_items": [],
+            "instructions": [],
+            "payment_instructions": [],
+            "transfers": [],
+            "payments": [],
+            "payment_orders": [],
+            "orders": [],
+            "total_amount_cents": 0,
+        }
+        return {**data, "payment_order": None, "order": None}
+
+    def _normalize_payee_selection(raw_payees: Any) -> list[str]:
+        if raw_payees is None:
+            return []
+        if not isinstance(raw_payees, list):
+            raise err(400, "payee_ids_must_be_list",
+                      "payee_ids must be a list")
+        payees: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_payees:
+            if isinstance(raw, dict):
+                payee = _payee_id(_pick(
+                    raw, "payee_id", "payee", "recipient_id", "recipient"
+                ))
+            else:
+                payee = _payee_id(raw)
+            if payee not in seen:
+                seen.add(payee)
+                payees.append(payee)
+        return payees
+
+    def _create_payment_order(
+        conn: sqlite3.Connection,
+        session_id: int,
+        payload: Any,
+        header_keys: list[str | None],
+    ) -> tuple[dict[str, Any], int]:
+        if not isinstance(payload, dict):
+            body: dict[str, Any] = {}
+            if isinstance(payload, list):
+                body["payee_ids"] = payload
+        else:
+            body = payload
+
+        request_key = _pick(
+            body, "request_id", "idempotency_key", "request_key", "key"
+        )
+        if request_key is None:
+            request_key = next((key for key in header_keys if key), None)
+        if not request_key:
+            raise err(400, "request_id_required",
+                      "a request_id or Idempotency-Key is required")
+        request_key = str(request_key)
+        request_hash = _content_hash(payload)
+
+        existing = conn.execute(
+            "SELECT * FROM payment_idempotency "
+            "WHERE session_id=? AND request_key=?",
+            (session_id, request_key),
+        ).fetchone()
+        if existing is not None:
+            if not hmac.compare_digest(existing["request_hash"], request_hash):
+                raise err(
+                    409, "idempotency_key_content_conflict",
+                    f"request_id {request_key} was already used with different "
+                    "content",
+                )
+            if existing["order_id"] is None:
+                return _no_payment_order_body(
+                    session_id, request_key, replayed=True
+                ), 200
+            order_row = conn.execute(
+                "SELECT * FROM payment_orders WHERE id=? AND session_id=?",
+                (existing["order_id"], session_id),
+            ).fetchone()
+            if order_row is None:
+                raise err(500, "idempotent_order_missing",
+                          "stored idempotency record points to a missing order")
+            order = _payment_order_dict(conn, order_row)
+            order["created"] = False
+            order["replayed"] = True
+            return _wrapped_order(order), 200
+
+        current_row = _current_billing_row(conn, session_id)
+        current_version = current_row["version"] if current_row else 0
+        if current_version == 0:
+            raise err(409, "no_current_billing_version",
+                      "submit a billing version before creating payment orders")
+
+        requested_version_raw = _pick(
+            body, "account_version", "billing_version", "ledger_version",
+            "account_revision", "version", "base_version",
+        )
+        requested_version = (
+            current_version if requested_version_raw is None
+            else _required_int(requested_version_raw, "account_version", minimum=0)
+        )
+        if requested_version != current_version:
+            raise err(
+                409, "stale_account_version",
+                f"account is at version {current_version}; payment request "
+                f"used version {requested_version}",
+            )
+
+        raw_payees = _pick(
+            body, "payee_ids", "selected_payee_ids", "payees",
+            "selected_payees", "recipients",
+        )
+        if raw_payees is None:
+            singular_payee = _pick(
+                body, "payee_id", "payee", "recipient_id", "recipient"
+            )
+            raw_payees = [singular_payee] if singular_payee is not None else None
+        balances = _payee_balances(conn, session_id, current_version)
+        balance_by_payee = {b["payee_id"]: b for b in balances}
+        if raw_payees is None:
+            selected = [
+                b["payee_id"] for b in balances if b["balance_cents"] > 0
+            ]
+        else:
+            selected = _normalize_payee_selection(raw_payees)
+
+        positive_items = [
+            (payee, int(balance_by_payee.get(payee, {}).get(
+                "balance_cents", 0)))
+            for payee in selected
+        ]
+        positive_items = [(p, amount) for p, amount in positive_items
+                           if amount > 0]
+
+        if not positive_items:
+            conn.execute(
+                "INSERT INTO payment_idempotency "
+                "(session_id, request_key, request_hash, order_id) "
+                "VALUES (?, ?, ?, NULL)",
+                (session_id, request_key, request_hash),
+            )
+            return _no_payment_order_body(
+                session_id, request_key, replayed=False
+            ), 200
+
+        total_amount = sum(amount for _p, amount in positive_items)
+        order_cursor = conn.execute(
+            "INSERT INTO payment_orders "
+            "(session_id, order_no, request_key, account_version, status, "
+            "total_amount_cents) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (session_id, "PENDING_ORDER_NO", request_key,
+             current_version, total_amount),
+        )
+        order_id = order_cursor.lastrowid
+        order_no = f"PO-{order_id:08d}"
+        conn.execute(
+            "UPDATE payment_orders SET order_no=? WHERE id=?",
+            (order_no, order_id),
+        )
+        for payee, amount in positive_items:
+            conn.execute(
+                "INSERT INTO payment_items "
+                "(session_id, order_id, payee_id, account_version, "
+                "amount_cents, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                (session_id, order_id, payee, current_version, amount),
+            )
+        conn.execute(
+            "INSERT INTO payment_idempotency "
+            "(session_id, request_key, request_hash, order_id) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, request_key, request_hash, order_id),
+        )
+        order_row = conn.execute(
+            "SELECT * FROM payment_orders WHERE id=?", (order_id,)
+        ).fetchone()
+        order = _payment_order_dict(conn, order_row)
+        order["created"] = True
+        order["replayed"] = False
+        return _wrapped_order(order), 201
+
+    def _receipt_outcome(raw: dict[str, Any]) -> str:
+        value = _pick(raw, "status", "result", "outcome", "state",
+                      "receipt_status")
+        if value is None and "confirmed" in raw:
+            if raw["confirmed"] is True:
+                return "paid"
+            if raw["confirmed"] is False:
+                return "unpaid"
+        if value is None:
+            raise err(400, "receipt_status_required",
+                      "each receipt must be paid or unpaid")
+        status = str(value).strip().lower().replace("-", "_")
+        paid_values = {
+            "paid", "confirmed_paid", "success", "succeeded", "successful",
+            "received", "complete", "completed", "已付", "确认已付",
+        }
+        unpaid_values = {
+            "unpaid", "confirmed_unpaid", "not_paid", "failed", "failure",
+            "returned", "bounced", "rejected", "未付", "确认未付",
+        }
+        pending_values = {"pending", "unknown", "undecided", "待回执", "尚无定论"}
+        if status in paid_values:
+            return "paid"
+        if status in unpaid_values:
+            return "unpaid"
+        if status in pending_values:
+            return "pending"
+        raise err(400, "invalid_receipt_status",
+                  f"unsupported receipt status {value!r}")
+
+    def _update_order_status(
+        conn: sqlite3.Connection, order_id: int
+    ) -> None:
+        counts = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,"
+            "SUM(CASE WHEN status='paid' THEN amount_cents ELSE 0 END) AS paid_amount,"
+            "SUM(CASE WHEN status='unpaid' THEN amount_cents ELSE 0 END) AS unpaid_amount,"
+            "COUNT(*) AS item_count "
+            "FROM payment_items WHERE order_id=?",
+            (order_id,),
+        ).fetchone()
+        if counts["pending_count"]:
+            if counts["paid_amount"] or counts["unpaid_amount"]:
+                status = "partially_receipted"
+            else:
+                status = "pending"
+        else:
+            status = "completed"
+        conn.execute(
+            "UPDATE payment_orders SET status=? WHERE id=?",
+            (status, order_id),
+        )
+
+    def _resolve_order_id(
+        conn: sqlite3.Connection, session_id: int, order_ref: str | int
+    ) -> int:
+        ref = str(order_ref)
+        row = None
+        if ref.isdigit():
+            row = conn.execute(
+                "SELECT id FROM payment_orders WHERE id=? AND session_id=?",
+                (int(ref), session_id),
+            ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT id FROM payment_orders "
+                "WHERE order_no=? AND session_id=?",
+                (ref, session_id),
+            ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT id FROM payment_orders "
+                "WHERE request_key=? AND session_id=?",
+                (ref, session_id),
+            ).fetchone()
+        if row is None:
+            raise err(404, "payment_order_not_found",
+                      f"payment order {order_ref} does not exist")
+        return int(row["id"])
+
+    def _register_receipts(
+        conn: sqlite3.Connection,
+        session_id: int,
+        raw_receipts: Any,
+        order_id: int | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(raw_receipts, list) or not raw_receipts:
+            raise err(400, "receipts_required",
+                      "a non-empty list of receipt results is required")
+
+        target_order: sqlite3.Row | None = None
+        if order_id is not None:
+            target_order = conn.execute(
+                "SELECT * FROM payment_orders WHERE id=? AND session_id=?",
+                (order_id, session_id),
+            ).fetchone()
+            if target_order is None:
+                raise err(404, "payment_order_not_found",
+                          f"payment order {order_id} does not exist")
+
+        item_rows = conn.execute(
+            "SELECT * FROM payment_items WHERE session_id=?",
+            (session_id,),
+        ).fetchall()
+        items_by_id = {row["id"]: row for row in item_rows}
+        decisions: dict[int, tuple[str, str | None, int | None]] = {}
+        referenced_order_ids: set[int] = set()
+
+        for raw in raw_receipts:
+            if not isinstance(raw, dict):
+                raise err(400, "invalid_receipt",
+                          "each receipt must be an object")
+            item_id = _required_int(
+                _pick(raw, "payment_item_id", "item_id", "instruction_id",
+                      "payment_instruction_id", "payment_id", "id"),
+                "payment_item_id", minimum=1,
+            )
+            item = items_by_id.get(item_id)
+            if item is None:
+                raise err(404, "payment_item_not_found",
+                          f"payment item {item_id} does not exist")
+            if order_id is not None and item["order_id"] != order_id:
+                raise err(404, "payment_item_not_in_order",
+                          f"payment item {item_id} is not in order {order_id}")
+            referenced_order_ids.add(item["order_id"])
+
+            outcome = _receipt_outcome(raw)
+            external_no: str | None = None
+            paid_amount: int | None = None
+            if outcome == "paid":
+                external_no = _receipt_no(_pick(
+                    raw, "external_receipt_no", "receipt_no", "receipt_id",
+                    "external_receipt_id", "receipt_number",
+                    "external_receipt_number", "external_reference",
+                    "bank_receipt_no",
+                ))
+                paid_amount = _required_int(
+                    _pick(raw, "amount_cents", "receipt_amount_cents",
+                          "paid_amount_cents", "amount", "paid_amount"),
+                    "amount_cents",
+                )
+                if paid_amount != item["amount_cents"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "receipt_amount_mismatch",
+                            "message": "paid receipt amount must equal the "
+                                       "original payment instruction amount",
+                            "payment_item_id": item_id,
+                            "instruction_amount_cents": item["amount_cents"],
+                            "receipt_amount_cents": paid_amount,
+                        },
+                    )
+
+            if item_id in decisions:
+                old_outcome, old_no, old_amount = decisions[item_id]
+                same = (
+                    outcome == old_outcome
+                    and external_no == old_no
+                    and paid_amount == old_amount
+                )
+                if not same:
+                    raise err(409, "conflicting_receipt_batch",
+                              f"payment item {item_id} has conflicting receipt "
+                              "results in the same batch")
+                continue
+
+            if item["status"] == "paid":
+                same_paid = (
+                    outcome == "paid"
+                    and external_no == item["external_receipt_no"]
+                    and paid_amount == item["receipt_amount_cents"]
+                )
+                if same_paid:
+                    continue
+                raise err(409, "receipt_already_recorded",
+                          f"payment item {item_id} already has a conflicting "
+                          "paid receipt")
+            if item["status"] == "unpaid":
+                if outcome == "unpaid":
+                    continue
+                raise err(409, "receipt_already_recorded",
+                          f"payment item {item_id} was already confirmed unpaid")
+
+            # Item is still pending.
+            if outcome == "pending":
+                decisions[item_id] = ("pending", None, None)
+                continue
+
+            if outcome == "paid":
+                duplicate = conn.execute(
+                    "SELECT id FROM payment_items "
+                    "WHERE session_id=? AND status='paid' "
+                    "AND external_receipt_no=? AND id<>?",
+                    (session_id, external_no, item_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise err(
+                        409, "external_receipt_no_already_used",
+                        f"external receipt number {external_no} is already "
+                        f"used by payment item {duplicate['id']}",
+                    )
+                for other_id, decision in decisions.items():
+                    if (other_id != item_id and decision[0] == "paid"
+                            and decision[1] == external_no):
+                        raise err(
+                            409, "external_receipt_no_already_used",
+                            f"external receipt number {external_no} occurs for "
+                            "two payment items in this batch",
+                        )
+
+            decisions[item_id] = (outcome, external_no, paid_amount)
+
+        touched_order_ids: set[int] = set()
+        for item_id, (outcome, external_no, paid_amount) in decisions.items():
+            item = items_by_id[item_id]
+            touched_order_ids.add(item["order_id"])
+            if item["status"] != "pending" or outcome == "pending":
+                continue
+            if outcome == "paid":
+                conn.execute(
+                    "UPDATE payment_items SET status='paid', "
+                    "external_receipt_no=?, receipt_amount_cents=?, "
+                    "receipted_at=datetime('now') "
+                    "WHERE id=? AND status='pending'",
+                    (external_no, paid_amount, item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE payment_items SET status='unpaid', "
+                    "receipted_at=datetime('now') "
+                    "WHERE id=? AND status='pending'",
+                    (item_id,),
+                )
+
+        for touched_order_id in touched_order_ids:
+            _update_order_status(conn, touched_order_id)
+
+        if order_id is None:
+            if not referenced_order_ids:
+                raise err(400, "receipts_required",
+                          "no payment items were referenced")
+            # 单条目接口只处理一个付款项；若以后开放跨单回执，调用方应分别查询。
+            order_id = sorted(referenced_order_ids)[0]
+        order_row = conn.execute(
+            "SELECT * FROM payment_orders WHERE id=? AND session_id=?",
+            (order_id, session_id),
+        ).fetchone()
+        if order_row is None:
+            raise err(404, "payment_order_not_found",
+                      "receipts were recorded but payment order is missing")
+        order = _payment_order_dict(conn, order_row)
+        order["receipt_batch_applied"] = bool(touched_order_ids)
+        return _wrapped_order(order)
+
+    # ---- 核账路由 ------------------------------------------------------- #
+
+    @app.post("/sessions/{session_id}/billing/versions", status_code=201)
+    def submit_billing_version(
+        session_id: int,
+        payload: dict[str, Any] | None = None,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.immediate_transaction(conn):
+            return _create_billing_version(conn, session_id, payload or {})
+
+    @app.get("/sessions/{session_id}/billing/versions")
+    def list_billing_versions(
+        session_id: int,
+        version: int | None = Query(default=None, ge=1),
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            if version is not None:
+                row = conn.execute(
+                    "SELECT * FROM billing_versions "
+                    "WHERE session_id=? AND version=?",
+                    (session_id, version),
+                ).fetchone()
+                if row is None:
+                    raise err(404, "billing_version_not_found",
+                              f"billing version {version} does not exist")
+                return _billing_version_dict(conn, row)
+            rows = conn.execute(
+                "SELECT * FROM billing_versions WHERE session_id=? "
+                "ORDER BY version",
+                (session_id,),
+            ).fetchall()
+            current_version = rows[-1]["version"] if rows else 0
+            versions = [
+                _billing_version_dict(
+                    conn, row, current_version=current_version,
+                    include_slots=False,
+                )
+                for row in rows
+            ]
+            return {
+                "session_id": session_id,
+                "current_version": current_version,
+                "versions": versions,
+                "billing_versions": versions,
+            }
+
+    @app.get("/sessions/{session_id}/billing/versions/{version}")
+    def get_billing_version(
+        session_id: int,
+        version: str,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            if version in {"current", "latest"}:
+                row = _current_billing_row(conn, session_id)
+                if row is None:
+                    balances = _payee_balances(conn, session_id, 0)
+                    return {
+                        "session_id": session_id,
+                        "exists": False,
+                        "version": 0,
+                        "account_version": 0,
+                        "current_version": 0,
+                        "cutoff_slot": 0,
+                        "end_slot": 0,
+                        "entries": [],
+                        "billing_entries": [],
+                        "balances": balances,
+                        "payee_balances": balances,
+                    }
+            elif version.isdigit():
+                row = conn.execute(
+                    "SELECT * FROM billing_versions "
+                    "WHERE session_id=? AND version=?",
+                    (session_id, int(version)),
+                ).fetchone()
+            else:
+                row = None
+            if row is None:
+                raise err(404, "billing_version_not_found",
+                          f"billing version {version} does not exist")
+            return _billing_version_dict(conn, row)
+
+    @app.get("/sessions/{session_id}/billing/current")
+    @app.get("/sessions/{session_id}/billing/latest")
+    @app.get("/sessions/{session_id}/billing/versions/current")
+    @app.get("/sessions/{session_id}/billing/versions/latest")
+    @app.get("/sessions/{session_id}/accounting/current")
+    @app.get("/sessions/{session_id}/ledger/current")
+    def get_current_billing(
+        session_id: int,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            row = _current_billing_row(conn, session_id)
+            balances = _payee_balances(conn, session_id)
+            if row is None:
+                return {
+                    "session_id": session_id,
+                    "exists": False,
+                    "version": 0,
+                    "account_version": 0,
+                    "current_version": 0,
+                    "cutoff_slot": 0,
+                    "end_slot": 0,
+                    "entries": [],
+                    "billing_entries": [],
+                    "balances": balances,
+                    "payee_balances": balances,
+                }
+            result = _billing_version_dict(conn, row)
+            result["exists"] = True
+            result["balances"] = balances
+            result["payee_balances"] = balances
+            return result
+
+    @app.get("/sessions/{session_id}/balances")
+    @app.get("/sessions/{session_id}/billing/balances")
+    @app.get("/sessions/{session_id}/billing/payees")
+    @app.get("/sessions/{session_id}/payment-balances")
+    @app.get("/sessions/{session_id}/payees")
+    def get_payee_balances(
+        session_id: int,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            current_row = _current_billing_row(conn, session_id)
+            current_version = current_row["version"] if current_row else 0
+            balances = _payee_balances(conn, session_id, current_version)
+            return {
+                "session_id": session_id,
+                "current_version": current_version,
+                "account_version": current_version,
+                "balances": balances,
+                "payee_balances": balances,
+                "payees": balances,
+            }
+
+    @app.get("/sessions/{session_id}/payees/{payee_id}/balance")
+    @app.get("/sessions/{session_id}/billing/payees/{payee_id}/balance")
+    @app.get("/sessions/{session_id}/balances/{payee_id}")
+    def get_payee_balance(
+        session_id: int,
+        payee_id: str,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        normalized = _payee_id(payee_id)
+        with dbmod.read_transaction(conn):
+            balances = _payee_balances(conn, session_id)
+            balance = next(
+                (b for b in balances if b["payee_id"] == normalized),
+                None,
+            )
+            if balance is None:
+                balance = {
+                    "payee_id": normalized,
+                    "payee": normalized,
+                    "current_payable_cents": 0,
+                    "payable_cents": 0,
+                    "payable": 0,
+                    "paid_cents": 0,
+                    "paid": 0,
+                    "occupied_cents": 0,
+                    "occupied": 0,
+                    "reserved_cents": 0,
+                    "held_cents": 0,
+                    "pending_receipt_cents": 0,
+                    "pending_cents": 0,
+                    "pending_amount_cents": 0,
+                    "balance_cents": 0,
+                    "balance": 0,
+                    "remaining_balance_cents": 0,
+                    "remaining_payable_cents": 0,
+                    "available_cents": 0,
+                    "available_balance_cents": 0,
+                    "openable_amount_cents": 0,
+                    "can_open_amount_cents": 0,
+                }
+            return balance
+
+    # ---- 付款单路由 ----------------------------------------------------- #
+
+    @app.post("/sessions/{session_id}/payment-orders", status_code=201)
+    async def create_payment_order(
+        session_id: int,
+        request: Request,
+        response: Response,
+        x_staff_token: str | None = Header(default=None),
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+        x_idempotency_key: str | None = Header(
+            default=None, alias="X-Idempotency-Key"
+        ),
+        x_request_id: str | None = Header(
+            default=None, alias="X-Request-Id"
+        ),
+        request_id: str | None = None,
+        idempotency_key_query: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        payload = await _json_body(request)
+        with dbmod.immediate_transaction(conn):
+            body, status_code = _create_payment_order(
+                conn, session_id, payload,
+                [request_id, idempotency_key_query, idempotency_key,
+                 x_idempotency_key, x_request_id],
+            )
+        response.status_code = status_code
+        return body
+
+    @app.get("/sessions/{session_id}/payment-orders")
+    def list_payment_orders(
+        session_id: int,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            rows = conn.execute(
+                "SELECT * FROM payment_orders WHERE session_id=? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            orders = [_payment_order_dict(conn, row) for row in rows]
+            return {
+                "session_id": session_id,
+                "payment_orders": orders,
+                "orders": orders,
+            }
+
+    @app.get("/sessions/{session_id}/payment-orders/{order_id}")
+    def get_payment_order(
+        session_id: int,
+        order_id: str,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            row = None
+            if order_id.isdigit():
+                row = conn.execute(
+                    "SELECT * FROM payment_orders WHERE id=? AND session_id=?",
+                    (int(order_id), session_id),
+                ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT * FROM payment_orders "
+                    "WHERE request_key=? AND session_id=?",
+                    (order_id, session_id),
+                ).fetchone()
+            if row is None:
+                raise err(404, "payment_order_not_found",
+                          f"payment order {order_id} does not exist")
+            return _wrapped_order(_payment_order_dict(conn, row))
+
+    @app.get("/sessions/{session_id}/payment-orders/by-request/{request_key}")
+    @app.get("/sessions/{session_id}/payment-orders/request/{request_key}")
+    def get_payment_order_by_request(
+        session_id: int,
+        request_key: str,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        with dbmod.read_transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM payment_orders "
+                "WHERE session_id=? AND request_key=?",
+                (session_id, request_key),
+            ).fetchone()
+            if row is None:
+                idem = conn.execute(
+                    "SELECT * FROM payment_idempotency "
+                    "WHERE session_id=? AND request_key=?",
+                    (session_id, request_key),
+                ).fetchone()
+                if idem is not None and idem["order_id"] is None:
+                    return _no_payment_order_body(
+                        session_id, request_key, replayed=True
+                    )
+                raise err(404, "payment_order_not_found",
+                          f"no payment order for request {request_key}")
+            return _wrapped_order(_payment_order_dict(conn, row))
+
+    @app.post("/sessions/{session_id}/payment-orders/{order_id}/receipts")
+    async def register_payment_order_receipts(
+        session_id: int,
+        order_id: str,
+        request: Request,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        body = await _json_body(request)
+        if isinstance(body, list):
+            raw_receipts: Any = body
+        elif isinstance(body, dict):
+            raw_receipts = _pick(
+                body, "receipts", "items", "results", "payment_items"
+            )
+            if raw_receipts is None and _pick(
+                body, "payment_item_id", "item_id", "instruction_id",
+                "payment_instruction_id", "payment_id", "id",
+            ) is not None:
+                raw_receipts = [body]
+            if raw_receipts is None:
+                raise err(400, "receipts_required",
+                          "receipts list or a single receipt object is required")
+        else:
+            raw_receipts = []
+        with dbmod.immediate_transaction(conn):
+            resolved_order_id = _resolve_order_id(conn, session_id, order_id)
+            return _register_receipts(
+                conn, session_id, raw_receipts,
+                order_id=resolved_order_id,
+            )
+
+    @app.post("/sessions/{session_id}/receipts")
+    @app.post("/sessions/{session_id}/payment-receipts")
+    async def register_session_receipts(
+        session_id: int,
+        request: Request,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        body = await _json_body(request)
+        order_ref: Any = None
+        if isinstance(body, list):
+            raw_receipts: Any = body
+        elif isinstance(body, dict):
+            order_ref = _pick(
+                body, "payment_order_id", "order_id", "order_no",
+                "payment_order_no",
+            )
+            raw_receipts = _pick(
+                body, "receipts", "items", "results", "payment_items"
+            )
+            if raw_receipts is None and _pick(
+                body, "payment_item_id", "item_id", "instruction_id",
+                "payment_instruction_id", "payment_id", "id",
+            ) is not None:
+                raw_receipts = [body]
+            if raw_receipts is None:
+                raise err(400, "receipts_required",
+                          "receipts list or a single receipt object is required")
+        else:
+            raw_receipts = []
+        with dbmod.immediate_transaction(conn):
+            order_id = (
+                _resolve_order_id(conn, session_id, order_ref)
+                if order_ref is not None else None
+            )
+            return _register_receipts(
+                conn, session_id, raw_receipts, order_id=order_id
+            )
+
+    @app.post("/sessions/{session_id}/payment-items/{item_id}/receipt")
+    @app.post("/sessions/{session_id}/payment-items/{item_id}/receipts")
+    @app.post("/sessions/{session_id}/payments/{item_id}/receipt")
+    @app.post("/sessions/{session_id}/payment-instructions/{item_id}/receipt")
+    async def register_payment_item_receipt(
+        session_id: int,
+        item_id: int,
+        request: Request,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        require_staff(conn, session_id, x_staff_token)
+        body = await _json_body(request)
+        raw: dict[str, Any] = body if isinstance(body, dict) else {}
+        raw.setdefault("payment_item_id", item_id)
+        with dbmod.immediate_transaction(conn):
+            return _register_receipts(conn, session_id, [raw])
+
+    # 非嵌套别名：与既有 /duties/{id} 路由风格保持一致。
+    @app.post("/payment-orders/{order_id}/receipts")
+    @app.post("/payment_orders/{order_id}/receipts")
+    async def register_receipts_without_session(
+        order_id: str,
+        request: Request,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        ref = str(order_id)
+        order = None
+        if ref.isdigit():
+            order = conn.execute(
+                "SELECT * FROM payment_orders WHERE id=?", (int(ref),)
+            ).fetchone()
+        if order is None:
+            order = conn.execute(
+                "SELECT * FROM payment_orders WHERE order_no=?", (ref,)
+            ).fetchone()
+        if order is None:
+            key_rows = conn.execute(
+                "SELECT * FROM payment_orders WHERE request_key=?", (ref,)
+            ).fetchall()
+            if len(key_rows) == 1:
+                order = key_rows[0]
+        if order is None:
+            raise err(404, "payment_order_not_found",
+                      f"payment order {order_id} does not exist")
+        require_staff(conn, order["session_id"], x_staff_token)
+        body = await _json_body(request)
+        if isinstance(body, list):
+            raw_receipts = body
+        elif isinstance(body, dict):
+            raw_receipts = _pick(body, "receipts", "items", "results") or [body]
+        else:
+            raw_receipts = []
+        with dbmod.immediate_transaction(conn):
+            return _register_receipts(
+                conn, order["session_id"], raw_receipts,
+                order_id=int(order["id"]),
+            )
+
+    @app.post("/payment-items/{item_id}/receipt")
+    @app.post("/payment-items/{item_id}/receipts")
+    @app.post("/payments/{item_id}/receipt")
+    async def register_item_receipt_without_session(
+        item_id: int,
+        request: Request,
+        x_staff_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        item = conn.execute(
+            "SELECT * FROM payment_items WHERE id=?", (item_id,)
+        ).fetchone()
+        if item is None:
+            raise err(404, "payment_item_not_found",
+                      f"payment item {item_id} does not exist")
+        require_staff(conn, item["session_id"], x_staff_token)
+        body = await _json_body(request)
+        if isinstance(body, list):
+            raw_receipts: Any = body
+        else:
+            raw = dict(body) if isinstance(body, dict) else {}
+            raw.setdefault("payment_item_id", item_id)
+            raw_receipts = [raw]
+        with dbmod.immediate_transaction(conn):
+            return _register_receipts(
+                conn, item["session_id"], raw_receipts
+            )
+
+    # 常见命名别名，降低接口命名差异带来的集成成本。
+    billing_collection_aliases = [
+        "/sessions/{session_id}/billing",
+        "/sessions/{session_id}/billing/audit",
+        "/sessions/{session_id}/billing/reconcile",
+        "/sessions/{session_id}/billing/audits",
+        "/sessions/{session_id}/billings",
+        "/sessions/{session_id}/settlements",
+        "/sessions/{session_id}/reconciliations",
+    ]
+    for alias_path in billing_collection_aliases:
+        app.add_api_route(
+            alias_path, submit_billing_version, methods=["POST"],
+            status_code=201,
+        )
+        app.add_api_route(
+            alias_path, list_billing_versions, methods=["GET"],
+        )
+
+    billing_detail_aliases = [
+        "/sessions/{session_id}/billing/audits/{version}",
+        "/sessions/{session_id}/billings/{version}",
+        "/sessions/{session_id}/settlements/{version}",
+        "/sessions/{session_id}/reconciliations/{version}",
+    ]
+    for alias_path in billing_detail_aliases:
+        app.add_api_route(
+            alias_path, get_billing_version, methods=["GET"],
+        )
+
+    payment_collection_aliases = [
+        "/sessions/{session_id}/payment_orders",
+        "/sessions/{session_id}/payment-batches",
+        "/sessions/{session_id}/payout-batches",
+        "/sessions/{session_id}/payouts",
+        "/sessions/{session_id}/payout-orders",
+        "/sessions/{session_id}/payments/orders",
+    ]
+    for alias_path in payment_collection_aliases:
+        app.add_api_route(
+            alias_path, create_payment_order, methods=["POST"],
+            status_code=201,
+        )
+        app.add_api_route(
+            alias_path, list_payment_orders, methods=["GET"],
+        )
+
+    payment_detail_aliases = [
+        "/sessions/{session_id}/payment_orders/{order_id}",
+        "/sessions/{session_id}/payouts/{order_id}",
+        "/sessions/{session_id}/payout-orders/{order_id}",
+    ]
+    for alias_path in payment_detail_aliases:
+        app.add_api_route(alias_path, get_payment_order, methods=["GET"])
+
+    receipt_aliases = [
+        "/sessions/{session_id}/payment-orders/{order_id}/receipts",
+        "/sessions/{session_id}/payment-orders/{order_id}/receipt",
+        "/sessions/{session_id}/payment_orders/{order_id}/receipts",
+        "/sessions/{session_id}/payment_orders/{order_id}/receipt",
+        "/sessions/{session_id}/payouts/{order_id}/receipts",
+    ]
+    for alias_path in receipt_aliases:
+        app.add_api_route(
+            alias_path, register_payment_order_receipts,
+            methods=["POST", "PUT", "PATCH"],
+        )
 
     return app

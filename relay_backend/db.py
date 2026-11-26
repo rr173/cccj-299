@@ -193,6 +193,111 @@ CREATE TABLE IF NOT EXISTS edition_release_entries (
     kind         TEXT NOT NULL CHECK (kind IN ('audio', 'silence')),
     PRIMARY KEY (release_id, position)
 );
+
+-- ------------------------------------------------------------------------- --
+-- 核账、付款单与回执（billing / payment orders / receipts）
+-- ------------------------------------------------------------------------- --
+
+-- 每次核账（包括首次和后续更正）产生一个新的、不可变账版。
+CREATE TABLE IF NOT EXISTS billing_versions (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    version            INTEGER NOT NULL CHECK (version > 0),
+    base_version       INTEGER NOT NULL DEFAULT 0 CHECK (base_version >= 0),
+    cutoff_slot        INTEGER NOT NULL CHECK (cutoff_slot >= 0),
+    total_amount_cents INTEGER NOT NULL DEFAULT 0 CHECK (total_amount_cents >= 0),
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, version)
+);
+
+-- 账版中提交的计费条目。有声格数和金额在核账时冻结，旧账版不随后续更正改变。
+CREATE TABLE IF NOT EXISTS billing_entries (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id             INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    version_id             INTEGER NOT NULL REFERENCES billing_versions(id) ON DELETE CASCADE,
+    version                INTEGER NOT NULL,
+    ordinal                INTEGER NOT NULL DEFAULT 0,
+    duty_id                INTEGER NOT NULL REFERENCES duties(id) ON DELETE CASCADE,
+    start_slot             INTEGER NOT NULL CHECK (start_slot >= 0),
+    end_slot               INTEGER NOT NULL CHECK (end_slot >= start_slot),
+    payee_id               TEXT NOT NULL,
+    unit_amount_cents      INTEGER NOT NULL CHECK (unit_amount_cents >= 0),
+    voiced_slot_count      INTEGER NOT NULL CHECK (voiced_slot_count >= 0),
+    amount_cents           INTEGER NOT NULL CHECK (amount_cents >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS ix_billing_entries_version
+    ON billing_entries(session_id, version);
+CREATE INDEX IF NOT EXISTS ix_billing_entries_payee
+    ON billing_entries(session_id, version, payee_id);
+
+-- 每个账版条目实际计费的有声格；同时用于不可变明细和审计。
+CREATE TABLE IF NOT EXISTS billing_entry_slots (
+    entry_id          INTEGER NOT NULL REFERENCES billing_entries(id) ON DELETE CASCADE,
+    session_id        INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    version_id        INTEGER NOT NULL REFERENCES billing_versions(id) ON DELETE CASCADE,
+    slot              INTEGER NOT NULL CHECK (slot >= 0),
+    duty_id           INTEGER NOT NULL REFERENCES duties(id) ON DELETE CASCADE,
+    payee_id          TEXT NOT NULL,
+    unit_amount_cents INTEGER NOT NULL CHECK (unit_amount_cents >= 0),
+    PRIMARY KEY (entry_id, slot),
+    UNIQUE (version_id, slot)
+);
+
+-- 一次幂等开单请求对应一张批量付款单；没有正余额时 order_id 可为 NULL，
+-- 但请求指纹仍保存，保证同一 request_id 的重试不会在以后意外开单。
+CREATE TABLE IF NOT EXISTS payment_idempotency (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    request_key   TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    order_id      INTEGER,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, request_key)
+);
+
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    order_no           TEXT NOT NULL UNIQUE,
+    request_key        TEXT NOT NULL,
+    account_version    INTEGER NOT NULL CHECK (account_version > 0),
+    status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending', 'partially_receipted', 'completed')),
+    total_amount_cents INTEGER NOT NULL CHECK (total_amount_cents > 0),
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, request_key)
+);
+
+CREATE INDEX IF NOT EXISTS ix_payment_orders_session
+    ON payment_orders(session_id, id);
+
+-- 批量付款单中的逐条付款指令，每个收款方至多一条。
+CREATE TABLE IF NOT EXISTS payment_items (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id            INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    order_id              INTEGER NOT NULL REFERENCES payment_orders(id) ON DELETE CASCADE,
+    payee_id              TEXT NOT NULL,
+    account_version       INTEGER NOT NULL CHECK (account_version > 0),
+    amount_cents          INTEGER NOT NULL CHECK (amount_cents > 0),
+    status                TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending', 'paid', 'unpaid')),
+    external_receipt_no   TEXT,
+    receipt_amount_cents  INTEGER CHECK (receipt_amount_cents IS NULL OR receipt_amount_cents >= 0),
+    receipted_at          TEXT,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (order_id, payee_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_payment_items_payee_status
+    ON payment_items(session_id, payee_id, status);
+CREATE INDEX IF NOT EXISTS ix_payment_items_order
+    ON payment_items(order_id, id);
+
+-- 同一场内，外部已付回执号只能用于一个付款项。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_items_paid_receipt_no
+    ON payment_items(session_id, external_receipt_no)
+    WHERE status = 'paid' AND external_receipt_no IS NOT NULL;
 """
 
 

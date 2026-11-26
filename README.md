@@ -54,6 +54,12 @@ python3 demo/run_curated_demo.py
 | GET | `/sessions/{sid}/curated/draft` | 读精选草稿：版本号、逐项出现（`appearance_id` + 来源格号）与缝隙 |
 | POST | `/sessions/{sid}/curated/draft/edits` | 提交一批草稿编辑（整批生效或整批拒绝） |
 | POST | `/sessions/{sid}/curated/releases` | 把**当前非空**草稿版本发行，要求每格都有有效批准 |
+| POST/GET | `/sessions/{sid}/billing/versions` | 提交核账/更正账版，或列出不可变账版 |
+| GET | `/sessions/{sid}/billing/versions/{v}` | 查旧账版：截止格、按当班/条目的有声格数与金额 |
+| GET | `/sessions/{sid}/balances` | 各收款方当前应付、已付、待回执占用和可为负余额 |
+| POST/GET | `/sessions/{sid}/payment-orders` | 按当前账版和 `request_id` 幂等批量开单，或列出付款单 |
+| GET | `/sessions/{sid}/payment-orders/{id}` | 查付款单及逐条付款指令/回执状态 |
+| POST | `/sessions/{sid}/payment-orders/{id}/receipts` | 整批登记部分付款项的已付/未付回执（冲突整批拒绝） |
 
 ### 素材审核员（请求头 `X-Reviewer-Token`，建场次时签发）
 
@@ -108,6 +114,80 @@ python3 demo/run_curated_demo.py
 前面有缺口）/ `waiting`（等归属当班上传）/ `disqualified_only`（只剩失权旧
 声音，须重新提交）/ `not_assigned`（尚无当班覆盖）。`blocked` 字段直接给出
 当前卡住的格号与原因。
+
+## 核账与付款
+
+财务接口同样使用工作人员的 `X-Staff-Token`，不连接真实支付系统；所有金额均为
+非负整数分。
+
+### 核账账版
+
+`POST /sessions/{sid}/billing/versions`：
+
+```json
+{
+  "base_version": 2,
+  "cutoff_slot": 8,
+  "entries": [
+    {"duty_id": 1, "start_slot": 0, "end_slot": 4,
+     "payee_id": "interpreter-A", "unit_amount_cents": 1200},
+    {"duty_id": 2, "start_slot": 4, "end_slot": 8,
+     "payee_id": "interpreter-B", "unit_amount_cents": 1500}
+  ]
+}
+```
+
+* 核账范围固定为 `[0, cutoff_slot)`；`cutoff_slot` 不能超过当前已发布连续前缀
+  `frontier`，也不能小于上一账版的截止格。
+* 只统计已发布的有声格。每个有声格必须且只能匹配一条 `duty_id` 是该格实际录制
+  当班、且区间包含该格的条目。静音格、前缀外的暂存上传、精选中的重复引用均不
+  计费。
+* 首次提交传 `base_version: 0`；之后每次更正都提交**整个核账范围**的新条目。
+  接受后版本号加一，旧版的截止格、条目/当班有声格数和分项金额冻结保留。
+
+### 付款单、占用与回执
+
+`POST /sessions/{sid}/payment-orders`：
+
+```json
+{
+  "request_id": "payout-2026-11-26-01",
+  "account_version": 3,
+  "payee_ids": ["interpreter-A", "interpreter-B"]
+}
+```
+
+* 某收款方的可开单金额为
+  `current_payable_cents - paid_cents - occupied_cents`；仅当结果严格为正时生成
+  付款项。
+* 新单必须基于当前账版。开单后，待回执指令金额计入 `occupied_cents`；更正账版
+  不会修改或撤销旧指令，因此余额
+  `balance_cents = payable_cents - paid_cents - occupied_cents` 可能为负，后续
+  新应付会自然抵补。
+* 相同 `request_id` 与相同内容重试返回原付款单/原指令；同标识不同内容返回 409。
+  写事务使用 `BEGIN IMMEDIATE` 串行化，并发请求不会重复占用同一正余额。
+
+`POST /sessions/{sid}/payment-orders/{order_id}/receipts`：
+
+```json
+{"receipts": [
+  {"payment_item_id": 12, "status": "paid",
+   "external_receipt_no": "BANK-8842", "amount_cents": 4800},
+  {"payment_item_id": 13, "status": "unpaid"}
+]}
+```
+
+* 可只提交本批有结论的部分付款项；其余保持 `pending`。
+* 已付回执必须带本场唯一的外部回执号，且金额与原指令一致。重复相同结果是幂等
+  no-op；矛盾状态/金额/回执号会使整批原子拒绝。
+* 只有 `unpaid` 会释放占用，之后可用**新的** `request_id` 按当前余额再开单；
+  重试旧开单请求仍返回旧单，不会另开。
+* `GET /sessions/{sid}/balances` 与账版、单据、回执均持久化在同一个 SQLite
+  文件中，重启后可继续核对。
+
+小型行为测试见 `tests/test_billing.py`，其中包含“缺格补齐后后段原声才可计费”
+以及“旧付款指令在费率更正导致负余额后仍可回执、重试旧请求不多付”的端到端
+用例。
 
 ## 官方精选
 
