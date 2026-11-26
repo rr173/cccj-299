@@ -5,4 +5,5 @@ __pycache__/
 *.db-shm
 .pytest_cache/
 demo/out/
+demo/out_curated/
 .venv/
