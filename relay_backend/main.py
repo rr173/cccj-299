@@ -24,16 +24,49 @@ import hmac
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 
 from . import db as dbmod
+from . import dispatch as dispatch_mod
 from .wav import WavError, validate_mono_wav
 
 # 防止异常数据导致 frontier 扫描无界增长的安全阀。
 _MAX_SCAN_SLOTS = 1_000_000
+
+
+def parse_instant(value: Any, field: str) -> datetime:
+    """解析带时区的 ISO-8601 时间字符串，统一转成 UTC（naive 一律拒绝）。"""
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_instant",
+                    "message": f"{field} must be a non-empty ISO-8601 string"},
+        )
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_instant",
+                    "message": f"{field} is not a valid ISO-8601 timestamp"},
+        )
+    if parsed.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "timezone_required",
+                    "message": f"{field} must carry an explicit timezone offset"},
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def instant_text(moment: datetime) -> str:
+    """统一的 UTC ISO-8601 存储/展示文本。"""
+    return moment.astimezone(timezone.utc).isoformat()
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +141,8 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
     def list_duties(conn: sqlite3.Connection, session_id: int) -> list[sqlite3.Row]:
         return list(
             conn.execute(
-                "SELECT * FROM duties WHERE session_id=? ORDER BY start_slot, id",
+                "SELECT * FROM duties WHERE session_id=? AND superseded_at IS NULL "
+                "ORDER BY start_slot, id",
                 (session_id,),
             ).fetchall()
         )
@@ -117,10 +151,28 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
         """某格当前归属的当班（start_slot 最大且 <= slot 的 duty）。"""
         return conn.execute(
             """SELECT * FROM duties
-               WHERE session_id=? AND start_slot <= ?
+               WHERE session_id=? AND start_slot <= ? AND superseded_at IS NULL
                ORDER BY start_slot DESC, id DESC LIMIT 1""",
             (session_id, slot),
         ).fetchone()
+
+    def dispatch_link(conn: sqlite3.Connection,
+                      session_id: int) -> sqlite3.Row | None:
+        """场次所属的调度组接入记录；未接入返回 None。"""
+        return conn.execute(
+            "SELECT * FROM dispatch_group_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+
+    def require_not_dispatch_session(conn: sqlite3.Connection,
+                                     session_id: int) -> sqlite3.Row | None:
+        """已接入调度组的场次不能再走原人工排班接口绕过组内安排。"""
+        link = dispatch_link(conn, session_id)
+        if link is not None:
+            raise err(409, "session_managed_by_dispatch_group",
+                      f"session {session_id} is onboarded to dispatch group "
+                      f"{link['group_id']}; use the group scheduling endpoints")
+        return link
 
     def qualifying_audio(
         conn: sqlite3.Connection, session_id: int, slot: int
@@ -282,6 +334,7 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
             raise err(400, "bad_start_slot", "start_slot must be >= 0")
 
         with dbmod.immediate_transaction(conn):
+            require_not_dispatch_session(conn, session_id)
             duties = list_duties(conn, session_id)
             if not duties and start_slot != 0:
                 raise err(409, "first_duty_must_start_at_zero",
@@ -320,6 +373,7 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
 
         with dbmod.immediate_transaction(conn):
             sid = duty["session_id"]
+            require_not_dispatch_session(conn, sid)
             old_start = duty["start_slot"]
             frontier = compute_frontier(conn, sid)
             duties = list_duties(conn, sid)
@@ -368,6 +422,22 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
         if slot < 0:
             raise err(400, "bad_slot", "slot must be >= 0")
         with dbmod.immediate_transaction(conn):
+            link = dispatch_link(conn, session_id)
+            if link is not None:
+                has_schedule = conn.execute(
+                    "SELECT 1 FROM duties WHERE session_id=? "
+                    "AND superseded_at IS NULL LIMIT 1", (session_id,),
+                ).fetchone() is not None
+                if not has_schedule:
+                    # 不能靠确认静音提前开始一个尚无班表的场次。
+                    raise err(409, "dispatch_schedule_not_ready",
+                              "session is onboarded to a dispatch group but has no "
+                              "schedule yet; silence cannot start it")
+                if slot >= link["slot_count"]:
+                    # 不能把节目续到登记范围之外。
+                    raise err(409, "slot_outside_registered_range",
+                              f"slot {slot} is outside the registered program of "
+                              f"{link['slot_count']} slots")
             if is_silence(conn, session_id, slot):
                 raise err(409, "already_marked_silence",
                           f"slot {slot} is already marked silence and stays closed")
@@ -484,6 +554,12 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
             sid = duty["session_id"]
             # 重新读取 duty，避免事务外状态过期
             duty = get_duty(conn, duty_id)
+            link = dispatch_link(conn, sid)
+            if link is not None and slot >= link["slot_count"]:
+                # 接入场次不能把节目续到登记范围之外。
+                raise err(409, "slot_outside_registered_range",
+                          f"slot {slot} is outside the registered program of "
+                          f"{link['slot_count']} slots")
             if is_silence(conn, sid, slot):
                 raise err(409, "slot_marked_silence",
                           f"slot {slot} was marked silence; no further upload accepted")
@@ -587,6 +663,592 @@ def create_app(db_path: str | Path = "relay.db") -> FastAPI:
                         headers={"X-Interpreter": str(
                             conn.execute("SELECT interpreter FROM duties WHERE id=?",
                                          (row["duty_id"],)).fetchone()["interpreter"])})
+
+    # ------------------------------------------------------------------ #
+    # 跨会场补班（dispatch groups）
+    # ------------------------------------------------------------------ #
+    #
+    # 一个调度组共用一批口译员，登记若干分会场。组内提交人员可用时间变更后，
+    # 服务在一个写事务里给出并落实一份覆盖所有会场的完整班表；无解则整批拒绝、
+    # 原安排与人员信息一并不变。
+    #
+    # 班段 = 从格 0 到节目结束，按换人点切出的连续格段；每格仍按场次自身的
+    # slot_seconds（标准为 2 秒）换算成实际时间，跨会场的时间重叠判定用绝对时间。
+
+    def get_dispatch_group(conn: sqlite3.Connection,
+                           group_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM dispatch_groups WHERE id=?", (group_id,)
+        ).fetchone()
+        if row is None:
+            raise err(404, "dispatch_group_not_found",
+                      f"dispatch group {group_id} does not exist")
+        return row
+
+    def require_dispatcher(
+        conn: sqlite3.Connection, group_id: int, token: str | None
+    ) -> sqlite3.Row:
+        group = get_dispatch_group(conn, group_id)
+        if not token or not hmac.compare_digest(token, group["dispatcher_token"]):
+            raise err(403, "bad_dispatcher_token",
+                      "valid X-Dispatcher-Token for this dispatch group required")
+        return group
+
+    def group_session_links(
+        conn: sqlite3.Connection, group_id: int
+    ) -> list[sqlite3.Row]:
+        return list(conn.execute(
+            "SELECT * FROM dispatch_group_sessions WHERE group_id=? ORDER BY session_id",
+            (group_id,),
+        ).fetchall())
+
+    def handover_slots(conn: sqlite3.Connection,
+                       session_id: int) -> list[int]:
+        return [r["slot"] for r in conn.execute(
+            "SELECT slot FROM dispatch_handover_slots WHERE session_id=? ORDER BY slot",
+            (session_id,),
+        ).fetchall()]
+
+    def required_languages(conn: sqlite3.Connection,
+                           session_id: int) -> list[str]:
+        return [r["language"] for r in conn.execute(
+            "SELECT language FROM dispatch_session_languages "
+            "WHERE session_id=? ORDER BY language", (session_id,),
+        ).fetchall()]
+
+    def group_persons(
+        conn: sqlite3.Connection, group_id: int
+    ) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for row in conn.execute(
+            "SELECT person_id FROM dispatch_interpreters WHERE group_id=? "
+            "ORDER BY person_id", (group_id,),
+        ).fetchall():
+            result[row["person_id"]] = {"languages": [], "windows": []}
+        for row in conn.execute(
+            "SELECT person_id, language FROM dispatch_interpreter_languages "
+            "WHERE group_id=? ORDER BY person_id, language", (group_id,),
+        ).fetchall():
+            result[row["person_id"]]["languages"].append(row["language"])
+        for row in conn.execute(
+            "SELECT person_id, starts_at, ends_at FROM dispatch_availability "
+            "WHERE group_id=? ORDER BY id", (group_id,),
+        ).fetchall():
+            result[row["person_id"]]["windows"].append(
+                (row["starts_at"], row["ends_at"]))
+        return result
+
+    def build_segments(
+        conn: sqlite3.Connection, link: sqlite3.Row
+    ) -> list[dispatch_mod.Segment]:
+        """从登记的换人点构造该会场的全部班段，并标注锁定状态与当前归属。"""
+        sid = link["session_id"]
+        starts_at = datetime.fromisoformat(link["starts_at"])
+        slot_seconds = get_session(conn, sid)["slot_seconds"]
+        boundaries = sorted(set([0, link["slot_count"],
+                                 *handover_slots(conn, sid)]))
+        languages = frozenset(required_languages(conn, sid))
+        frontier = compute_frontier(conn, sid)
+        segments: list[dispatch_mod.Segment] = []
+        for start_slot, end_slot in zip(boundaries, boundaries[1:]):
+            seg_start = starts_at + timedelta(seconds=start_slot * slot_seconds)
+            seg_end = starts_at + timedelta(seconds=end_slot * slot_seconds)
+            owner = conn.execute(
+                "SELECT * FROM duties WHERE session_id=? AND start_slot=? "
+                "AND superseded_at IS NULL", (sid, start_slot),
+            ).fetchone()
+            # 班段内任一格已发布（含静音）即锁定，不能再换人。
+            locked = start_slot < frontier
+            # 锁定班段只需覆盖首个未发布格（frontier）到班段结束；新可用时间
+            # 不重新校验已发布前缀。
+            cover_start = (
+                starts_at + timedelta(seconds=max(frontier, start_slot)
+                                      * slot_seconds)
+                if locked else None
+            )
+            segments.append(dispatch_mod.Segment(
+                session_id=sid,
+                start_slot=start_slot,
+                end_slot=end_slot,
+                start=seg_start,
+                end=seg_end,
+                languages=languages,
+                locked=locked,
+                current_person=None if owner is None else owner["interpreter"],
+                cover_start=cover_start,
+            ))
+        return segments
+
+    def load_persons(
+        conn: sqlite3.Connection, group_id: int
+    ) -> dict[str, dispatch_mod.Person]:
+        raw = group_persons(conn, group_id)
+        persons: dict[str, dispatch_mod.Person] = {}
+        for person_id, data in raw.items():
+            windows = tuple(
+                (datetime.fromisoformat(start), datetime.fromisoformat(end))
+                for start, end in data["windows"]
+            )
+            persons[person_id] = dispatch_mod.Person(
+                person_id=person_id,
+                languages=frozenset(data["languages"]),
+                windows=windows,
+            )
+        return persons
+
+    def current_segment_duties(
+        conn: sqlite3.Connection, segments: list[dispatch_mod.Segment]
+    ) -> dict[tuple[int, int, int], sqlite3.Row]:
+        result: dict[tuple[int, int, int], sqlite3.Row] = {}
+        for segment in segments:
+            row = conn.execute(
+                "SELECT * FROM duties WHERE session_id=? AND start_slot=? "
+                "AND superseded_at IS NULL",
+                (segment.session_id, segment.start_slot),
+            ).fetchone()
+            if row is not None:
+                result[segment.key] = row
+        return result
+
+    def _person_id_value(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise err(400, "person_id_required",
+                      f"{field} must be a non-empty person identifier string")
+        return value.strip()
+
+    def _parse_roster(
+        payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """校验并归一化请求中的人员名单（语言能力 + 可用时间窗，全量替换）。"""
+        raw_people = payload.get("interpreters")
+        if not isinstance(raw_people, list):
+            raise err(400, "interpreters_required",
+                      "an 'interpreters' list is required")
+        parsed: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(raw_people):
+            if not isinstance(item, dict):
+                raise err(400, "invalid_interpreter",
+                          f"interpreters[{index}] must be an object")
+            person_id = _person_id_value(item.get("person_id"),
+                                         f"interpreters[{index}].person_id")
+            if person_id in seen:
+                raise err(400, "duplicate_person",
+                          f"person {person_id} appears more than once in the request")
+            seen.add(person_id)
+            languages = item.get("languages")
+            if not isinstance(languages, list) or not languages:
+                raise err(400, "languages_required",
+                          f"interpreters[{index}].languages must be a non-empty list")
+            langs: list[str] = []
+            for lang in languages:
+                if not isinstance(lang, str) or not lang.strip():
+                    raise err(400, "invalid_language",
+                              f"interpreters[{index}].languages entries must be "
+                              "non-empty strings")
+                langs.append(lang.strip())
+            windows_raw = item.get("availability_windows")
+            if not isinstance(windows_raw, list) or not windows_raw:
+                raise err(400, "availability_required",
+                          f"interpreters[{index}].availability_windows must be a "
+                          "non-empty list")
+            windows: list[tuple[datetime, datetime]] = []
+            for w_index, window in enumerate(windows_raw):
+                if not isinstance(window, dict):
+                    raise err(400, "invalid_window",
+                              f"interpreters[{index}].availability_windows[{w_index}] "
+                              "must be an object")
+                start = parse_instant(
+                    window.get("starts_at"),
+                    f"interpreters[{index}].availability_windows[{w_index}].starts_at")
+                end = parse_instant(
+                    window.get("ends_at"),
+                    f"interpreters[{index}].availability_windows[{w_index}].ends_at")
+                if end <= start:
+                    raise err(400, "bad_window_range",
+                              f"interpreters[{index}].availability_windows[{w_index}] "
+                              "requires ends_at > starts_at")
+                windows.append((start, end))
+            parsed.append({"person_id": person_id, "languages": sorted(set(langs)),
+                           "windows": windows})
+        return parsed
+
+    def replace_roster(
+        conn: sqlite3.Connection, group_id: int, people: list[dict[str, Any]]
+    ) -> None:
+        """全量替换组内人员、语言与可用时间窗（在调用方的写事务内执行）。"""
+        conn.execute("DELETE FROM dispatch_availability WHERE group_id=?",
+                     (group_id,))
+        conn.execute("DELETE FROM dispatch_interpreter_languages WHERE group_id=?",
+                     (group_id,))
+        conn.execute("DELETE FROM dispatch_interpreters WHERE group_id=?",
+                     (group_id,))
+        for person in people:
+            conn.execute(
+                "INSERT INTO dispatch_interpreters (group_id, person_id) "
+                "VALUES (?, ?)", (group_id, person["person_id"]))
+            conn.executemany(
+                "INSERT INTO dispatch_interpreter_languages "
+                "(group_id, person_id, language) VALUES (?, ?, ?)",
+                [(group_id, person["person_id"], lang)
+                 for lang in person["languages"]],
+            )
+            conn.executemany(
+                "INSERT INTO dispatch_availability "
+                "(group_id, person_id, starts_at, ends_at) VALUES (?, ?, ?, ?)",
+                [(group_id, person["person_id"], instant_text(start),
+                  instant_text(end))
+                 for start, end in person["windows"]],
+            )
+
+    def apply_schedule(
+        conn: sqlite3.Connection,
+        group_id: int,
+        assignment: dict[tuple[int, int, int], str],
+        segments: list[dispatch_mod.Segment],
+        reason: str | None,
+    ) -> int:
+        """把求解结果落实到 duties 并写一条不可变修订，返回新版本号。"""
+        group = get_dispatch_group(conn, group_id)
+        new_version = group["schedule_version"] + 1
+        cursor = conn.execute(
+            "INSERT INTO dispatch_revisions (group_id, version, reason) "
+            "VALUES (?, ?, ?)", (group_id, new_version, reason),
+        )
+        revision_id = cursor.lastrowid
+        conn.execute(
+            "UPDATE dispatch_groups SET schedule_version=? WHERE id=?",
+            (new_version, group_id),
+        )
+        ordered = sorted(segments, key=lambda s: (s.session_id, s.start_slot))
+        for index, segment in enumerate(ordered):
+            person_id = assignment[segment.key]
+            existing = conn.execute(
+                "SELECT * FROM duties WHERE session_id=? AND start_slot=? "
+                "AND superseded_at IS NULL",
+                (segment.session_id, segment.start_slot),
+            ).fetchone()
+            if existing is not None and existing["interpreter"] == person_id:
+                # 未换人的班段：保留原当班 ID 与凭据。
+                duty_id = existing["id"]
+            else:
+                if existing is not None:
+                    # 换人：旧当班被取代（行与 token 保留作历史，但不再负责该段）。
+                    conn.execute(
+                        "UPDATE duties SET superseded_at=datetime('now') WHERE id=?",
+                        (existing["id"],),
+                    )
+                token = "duty_" + uuid.uuid4().hex
+                cur = conn.execute(
+                    "INSERT INTO duties (session_id, interpreter, start_slot, "
+                    "duty_token) VALUES (?, ?, ?, ?)",
+                    (segment.session_id, person_id, segment.start_slot, token),
+                )
+                duty_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO dispatch_revision_segments (revision_id, group_id, "
+                "session_id, segment_index, start_slot, end_slot, person_id, "
+                "duty_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (revision_id, group_id, segment.session_id, index,
+                 segment.start_slot, segment.end_slot, person_id, duty_id),
+            )
+        return new_version
+
+    def coverage_dict(
+        conn: sqlite3.Connection, group_id: int, *, include_credentials: bool
+    ) -> dict[str, Any]:
+        group = get_dispatch_group(conn, group_id)
+        sessions_payload: list[dict[str, Any]] = []
+        for link in group_session_links(conn, group_id):
+            sid = link["session_id"]
+            session = get_session(conn, sid)
+            segments = build_segments(conn, link)
+            segment_payload: list[dict[str, Any]] = []
+            for segment in segments:
+                duty = conn.execute(
+                    "SELECT * FROM duties WHERE session_id=? AND start_slot=? "
+                    "AND superseded_at IS NULL",
+                    (sid, segment.start_slot),
+                ).fetchone()
+                item: dict[str, Any] = {
+                    "segment_index": len(segment_payload),
+                    "start_slot": segment.start_slot,
+                    "end_slot": segment.end_slot,
+                    "start_time": instant_text(segment.start),
+                    "end_time": instant_text(segment.end),
+                    "required_languages": sorted(segment.languages),
+                    "locked": segment.locked,
+                    "person_id": None if duty is None else duty["interpreter"],
+                    "duty_id": None if duty is None else duty["id"],
+                }
+                if include_credentials:
+                    # 当班凭据只发给本组授权调度员。
+                    item["duty_token"] = None if duty is None else duty["duty_token"]
+                segment_payload.append(item)
+            sessions_payload.append({
+                "session_id": sid,
+                "title": session["title"],
+                "starts_at": link["starts_at"],
+                "slot_count": link["slot_count"],
+                "slot_seconds": session["slot_seconds"],
+                "handover_slots": handover_slots(conn, sid),
+                "required_languages": required_languages(conn, sid),
+                "frontier": compute_frontier(conn, sid),
+                "segments": segment_payload,
+            })
+        return {
+            "group_id": group_id,
+            "name": group["name"],
+            "schedule_version": group["schedule_version"],
+            "sessions": sessions_payload,
+        }
+
+    @app.post("/dispatch-groups", status_code=201)
+    def create_dispatch_group(
+        payload: dict[str, Any] | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        name = str(payload.get("name") or "untitled dispatch group").strip()
+        token = "dispatch_" + uuid.uuid4().hex
+        with dbmod.immediate_transaction(conn):
+            cur = conn.execute(
+                "INSERT INTO dispatch_groups (name, dispatcher_token) "
+                "VALUES (?, ?)", (name, token),
+            )
+            group_id = cur.lastrowid
+            row = conn.execute("SELECT * FROM dispatch_groups WHERE id=?",
+                               (group_id,)).fetchone()
+        return {"group_id": group_id, "name": row["name"],
+                "dispatcher_token": row["dispatcher_token"],
+                "schedule_version": row["schedule_version"]}
+
+    @app.post("/dispatch-groups/{group_id}/sessions", status_code=201)
+    def register_dispatch_session(
+        group_id: int,
+        payload: dict[str, Any],
+        x_dispatcher_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        with dbmod.immediate_transaction(conn):
+            require_dispatcher(conn, group_id, x_dispatcher_token)
+            try:
+                session_id = int(payload["session_id"])
+            except (KeyError, TypeError, ValueError):
+                raise err(400, "session_id_required",
+                          "integer session_id is required")
+            session = get_session(conn, session_id)
+            # 每场只能加入一个组。
+            if dispatch_link(conn, session_id) is not None:
+                raise err(409, "session_already_onboarded",
+                          f"session {session_id} already belongs to a dispatch group")
+            # 只能登记尚未排班且没有音频或静音记录的场次。
+            if conn.execute(
+                "SELECT 1 FROM duties WHERE session_id=?", (session_id,)
+            ).fetchone() is not None:
+                raise err(409, "session_already_scheduled",
+                          "only sessions without any duties can be onboarded")
+            if conn.execute(
+                "SELECT 1 FROM submissions WHERE session_id=? LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None:
+                raise err(409, "session_has_audio",
+                          "sessions holding audio submissions cannot be onboarded")
+            if conn.execute(
+                "SELECT 1 FROM slot_marks WHERE session_id=? LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None:
+                raise err(409, "session_has_silence",
+                          "sessions holding silence marks cannot be onboarded")
+
+            starts_at = parse_instant(payload.get("starts_at"), "starts_at")
+            try:
+                slot_count = int(payload["slot_count"])
+            except (KeyError, TypeError, ValueError):
+                raise err(400, "slot_count_required",
+                          "integer slot_count is required")
+            if slot_count <= 0:
+                raise err(400, "bad_slot_count", "slot_count must be positive")
+
+            handover = payload.get("handover_slots", [])
+            if not isinstance(handover, list):
+                raise err(400, "bad_handover_slots",
+                          "handover_slots must be a list of integers")
+            handover_set: set[int] = set()
+            for value in handover:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise err(400, "bad_handover_slot",
+                              "handover_slots entries must be integers")
+                if value <= 0 or value >= slot_count:
+                    raise err(409, "handover_slot_out_of_range",
+                              f"handover slot {value} must be within "
+                              f"(0, {slot_count})")
+                if value in handover_set:
+                    raise err(409, "duplicate_handover_slot",
+                              f"handover slot {value} is duplicated")
+                handover_set.add(value)
+
+            languages = payload.get("languages")
+            if not isinstance(languages, list) or not languages:
+                raise err(400, "languages_required",
+                          "a non-empty required languages list is required")
+            lang_set: set[str] = set()
+            for lang in languages:
+                if not isinstance(lang, str) or not lang.strip():
+                    raise err(400, "invalid_language",
+                              "languages entries must be non-empty strings")
+                lang_set.add(lang.strip())
+
+            conn.execute(
+                "INSERT INTO dispatch_group_sessions (session_id, group_id, "
+                "starts_at, slot_count) VALUES (?, ?, ?, ?)",
+                (session_id, group_id, instant_text(starts_at), slot_count),
+            )
+            conn.executemany(
+                "INSERT INTO dispatch_handover_slots (session_id, slot) "
+                "VALUES (?, ?)",
+                [(session_id, slot) for slot in sorted(handover_set)],
+            )
+            conn.executemany(
+                "INSERT INTO dispatch_session_languages (session_id, language) "
+                "VALUES (?, ?)",
+                [(session_id, lang) for lang in sorted(lang_set)],
+            )
+            return {
+                "session_id": session_id,
+                "group_id": group_id,
+                "title": session["title"],
+                "starts_at": instant_text(starts_at),
+                "slot_count": slot_count,
+                "slot_seconds": session["slot_seconds"],
+                "handover_slots": sorted(handover_set),
+                "languages": sorted(lang_set),
+            }
+
+    @app.post("/dispatch-groups/{group_id}/schedule", status_code=201)
+    def fill_dispatch_schedule(
+        group_id: int,
+        payload: dict[str, Any] | None = None,
+        x_dispatcher_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        """提交人员可用时间变更，由服务给出并落实一份覆盖全部会场的完整班表。
+
+        首次排班与后续补班同一入口。整批原子：无解时人员信息、各会场班表与上传
+        资格一并不变。
+        """
+        payload = payload or {}
+        with dbmod.immediate_transaction(conn):
+            group = require_dispatcher(conn, group_id, x_dispatcher_token)
+            base_version = payload.get("base_version")
+            if base_version is not None:
+                try:
+                    base_version = int(base_version)
+                except (TypeError, ValueError):
+                    raise err(400, "invalid_base_version",
+                              "base_version must be an integer")
+                if base_version != group["schedule_version"]:
+                    raise err(409, "stale_schedule_version",
+                              f"group is at schedule version "
+                              f"{group['schedule_version']}; request was based on "
+                              f"{base_version}")
+            people = _parse_roster(payload)
+            links = group_session_links(conn, group_id)
+            if not links:
+                raise err(409, "dispatch_group_has_no_sessions",
+                          "register at least one session before scheduling")
+
+            segments: list[dispatch_mod.Segment] = []
+            for link in links:
+                segments.extend(build_segments(conn, link))
+            previous_duties = current_segment_duties(conn, segments)
+            previous_roster = group_persons(conn, group_id)
+
+            # 先落新名单再求解：求解基于本次提交的可用时间；若无解则整个事务
+            # 回滚，库内仍是旧名单与旧班表。
+            replace_roster(conn, group_id, people)
+            persons = load_persons(conn, group_id)
+            try:
+                assignment = dispatch_mod.solve(segments, persons)
+            except dispatch_mod.InfeasibleSchedule as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "schedule_infeasible",
+                        "message": "no complete schedule satisfies all constraints; "
+                                   "roster and existing duties are left unchanged",
+                        "schedule_version": group["schedule_version"],
+                        "uncoverable_segments": exc.issues,
+                    },
+                )
+
+            reason = payload.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                reason = str(reason)
+            new_version = apply_schedule(
+                conn, group_id, assignment, segments, reason,
+            )
+            # 换人后按新归属取消旧 active 提交的资格（跨会场逐会话执行）。
+            disqualified = 0
+            changed_sessions = sorted({s.session_id for s in segments})
+            for sid in changed_sessions:
+                disqualified += disqualify_outside(conn, sid)
+
+            changed_segments: list[dict[str, Any]] = []
+            for segment in sorted(segments, key=lambda s: s.key):
+                old = previous_duties.get(segment.key)
+                new_person = assignment[segment.key]
+                if old is None or old["interpreter"] != new_person:
+                    changed_segments.append({
+                        "session_id": segment.session_id,
+                        "start_slot": segment.start_slot,
+                        "end_slot": segment.end_slot,
+                        "previous_person_id": None if old is None
+                        else old["interpreter"],
+                        "person_id": new_person,
+                        "locked": segment.locked,
+                    })
+            result = coverage_dict(conn, group_id, include_credentials=True)
+            result["previous_schedule_version"] = group["schedule_version"]
+            result["changed_segments"] = changed_segments
+            result["reassigned_segment_count"] = len(changed_segments)
+            result["disqualified_submissions"] = disqualified
+            result["roster_replaced"] = sorted(previous_roster) != sorted(
+                p["person_id"] for p in people)
+            return result
+
+    @app.get("/dispatch-groups/{group_id}/coverage")
+    def read_dispatch_coverage(
+        group_id: int,
+        x_dispatcher_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        """授权调度员查看当前覆盖与当班凭据（含 duty_token）。"""
+        with dbmod.read_transaction(conn):
+            require_dispatcher(conn, group_id, x_dispatcher_token)
+            return coverage_dict(conn, group_id, include_credentials=True)
+
+    @app.get("/dispatch-groups/{group_id}")
+    def read_dispatch_group(
+        group_id: int,
+        x_dispatcher_token: str | None = Header(default=None),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        with dbmod.read_transaction(conn):
+            require_dispatcher(conn, group_id, x_dispatcher_token)
+            data = coverage_dict(conn, group_id, include_credentials=False)
+            data["interpreters"] = [
+                {
+                    "person_id": person_id,
+                    "languages": info["languages"],
+                    "availability_windows": [
+                        {"starts_at": start, "ends_at": end}
+                        for start, end in info["windows"]
+                    ],
+                }
+                for person_id, info in sorted(group_persons(conn, group_id).items())
+            ]
+            return data
 
     # ------------------------------------------------------------------ #
     # 官方精选：草稿、发行、回听

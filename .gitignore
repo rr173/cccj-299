@@ -6,4 +6,5 @@ __pycache__/
 .pytest_cache/
 demo/out/
 demo/out_curated/
+demo/out_dispatch/
 .venv/

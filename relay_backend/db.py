@@ -62,8 +62,15 @@ CREATE TABLE IF NOT EXISTS duties (
     start_slot   INTEGER NOT NULL CHECK (start_slot >= 0),
     duty_token   TEXT NOT NULL UNIQUE,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (session_id, start_slot)
+    -- 跨会场补班换人的班段：旧当班被取代但行保留（凭据与历史提交/核账可追溯）。
+    -- 同一 (session, start_slot) 同一时刻至多一个未被取代的当班。
+    superseded_at TEXT
 );
+
+-- 取代旧库的表级 UNIQUE(session_id, start_slot)：被 superseded 的旧当班保留，
+-- 只有当前当班占用换人点。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_duties_active_start
+    ON duties(session_id, start_slot) WHERE superseded_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS submissions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -298,7 +305,141 @@ CREATE INDEX IF NOT EXISTS ix_payment_items_order
 CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_items_paid_receipt_no
     ON payment_items(session_id, external_receipt_no)
     WHERE status = 'paid' AND external_receipt_no IS NOT NULL;
+
+-- ------------------------------------------------------------------------- --
+-- 跨会场补班（dispatch groups：多个分会场共用一批口译员）
+-- ------------------------------------------------------------------------- --
+--
+-- 一个调度组登记若干"尚未排班、没有音频/静音记录"的场次；每场只能加入一个组。
+-- 组内按人员 ID 管理口译员（语言能力与可用时间窗）。每次成功补班产生一条不可变
+-- 的班表修订（dispatch_revisions + dispatch_revision_segments），落实到 duties；
+-- 重启后以最后一次成功修订为准。
+
+CREATE TABLE IF NOT EXISTS dispatch_groups (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT NOT NULL,
+    dispatcher_token TEXT NOT NULL UNIQUE,
+    schedule_version INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 已接入组的场次。主键就是 session_id，保证每场至多加入一个组。
+CREATE TABLE IF NOT EXISTS dispatch_group_sessions (
+    session_id    INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    group_id      INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    -- 场次的绝对开播时间（UTC ISO-8601 文本，含时区）。
+    starts_at     TEXT NOT NULL,
+    slot_count    INTEGER NOT NULL CHECK (slot_count > 0),
+    registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_dispatch_group_sessions_group
+    ON dispatch_group_sessions(group_id);
+
+-- 允许换人的格号（换人点）。0 与 slot_count 是隐含边界；每个换人点唯一。
+CREATE TABLE IF NOT EXISTS dispatch_handover_slots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    slot       INTEGER NOT NULL CHECK (slot >= 0),
+    UNIQUE (session_id, slot)
+);
+
+-- 每场登记时提供的所需语言（可多个）；班段人员必须擅长其中至少一种。
+CREATE TABLE IF NOT EXISTS dispatch_session_languages (
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    language   TEXT NOT NULL,
+    PRIMARY KEY (session_id, language)
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_interpreters (
+    group_id  INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    person_id TEXT NOT NULL,
+    PRIMARY KEY (group_id, person_id)
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_interpreter_languages (
+    group_id  INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    person_id TEXT NOT NULL,
+    language  TEXT NOT NULL,
+    PRIMARY KEY (group_id, person_id, language)
+);
+
+-- 每人若干可用时间窗；覆盖判定按并集处理，首尾相接即可。
+CREATE TABLE IF NOT EXISTS dispatch_availability (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id  INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    person_id TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at   TEXT NOT NULL,
+    CHECK (ends_at > starts_at)
+);
+
+CREATE INDEX IF NOT EXISTS ix_dispatch_availability_person
+    ON dispatch_availability(group_id, person_id);
+
+-- 每次成功落实的班表都是一条不可变修订；同组修订号严格递增。
+CREATE TABLE IF NOT EXISTS dispatch_revisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id   INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    version    INTEGER NOT NULL CHECK (version > 0),
+    reason     TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (group_id, version)
+);
+
+-- 修订中每个班段冻结的归属人员。班段身份由 (session_id, start_slot) 标识。
+CREATE TABLE IF NOT EXISTS dispatch_revision_segments (
+    revision_id   INTEGER NOT NULL REFERENCES dispatch_revisions(id) ON DELETE CASCADE,
+    group_id      INTEGER NOT NULL REFERENCES dispatch_groups(id) ON DELETE CASCADE,
+    session_id    INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    segment_index INTEGER NOT NULL,
+    start_slot    INTEGER NOT NULL CHECK (start_slot >= 0),
+    end_slot      INTEGER NOT NULL CHECK (end_slot > start_slot),
+    person_id     TEXT NOT NULL,
+    duty_id       INTEGER REFERENCES duties(id) ON DELETE SET NULL,
+    PRIMARY KEY (revision_id, segment_index)
+);
+
+CREATE INDEX IF NOT EXISTS ix_dispatch_revision_segments_group
+    ON dispatch_revision_segments(group_id, session_id);
 """
+
+
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """旧库升级：把 duties 的表级 UNIQUE 换成支持"当班被取代后保留"的部分唯一索引。
+
+    新库的 SCHEMA 直接带 ``superseded_at`` 列；只有旧库需要这一步表重建。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(duties)").fetchall()}
+    if not cols or "superseded_at" in cols:
+        return
+    # SQLite 不能直接 DROP 表级约束，按官方配方重建表；临时关闭外键并在同一
+    # 连接内完成，submissions/billing 等引用的 duty id 保持不变。
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE duties_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id    INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                interpreter   TEXT NOT NULL,
+                start_slot    INTEGER NOT NULL CHECK (start_slot >= 0),
+                duty_token    TEXT NOT NULL UNIQUE,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                superseded_at TEXT
+            );
+            INSERT INTO duties_new
+                (id, session_id, interpreter, start_slot, duty_token, created_at)
+                SELECT id, session_id, interpreter, start_slot, duty_token, created_at
+                FROM duties;
+            DROP TABLE duties;
+            ALTER TABLE duties_new RENAME TO duties;
+            CREATE UNIQUE INDEX ux_duties_active_start
+                ON duties(session_id, start_slot) WHERE superseded_at IS NULL;
+            """
+        )
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -310,6 +451,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    _migrate_legacy_schema(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
